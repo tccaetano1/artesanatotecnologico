@@ -16,6 +16,9 @@ Funções desejáveis:
 - Configurar via aplicativo:
   * Tempo de escuta;
   * O ambiente, com possível armazenamento de ambientes configurados
+ 
+  * Escolha de leitura de ambiente
+  * - opções como leitura de estado da leitura ex:em movimento/parado/com chuva entre a transmissão e recepção
 
 
 
