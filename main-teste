@@ -1,0 +1,511 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_http_server.h"
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "cJSON.h"
+#include "esp_mac.h"
+#include "lwip/inet.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+
+// Definições para o Ponto de Acesso Wi-Fi
+#define WIFI_AP_SSID "ESP32_Network"
+#define WIFI_AP_PASSWORD "12345678"
+#define HTTP_SERVER_PORT 80
+
+// Definições para o envio de dados CSI via UDP
+#define SERVER_IP "192.168.0.2"  // Endereço IP do servidor UDP (ajuste conforme necessário)
+#define SERVER_PORT 12345            // Porta UDP no servidor
+#define UDP_LISTEN_PORT 12345    // Porta para receber comandos "start"
+#define MAX_CSI_DATA_LEN 2048        // Tamanho máximo para os dados CSI formatados
+
+// Definições para a coleta de dados CSI
+#define CONFIG_SEND_FREQUENCY 100
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    #define CSI_FORCE_LLTF 1
+#endif
+// Removido CONFIG_FORCE_GAIN para evitar erros de compilação
+// #define CONFIG_FORCE_GAIN 1
+
+// Tags para logs
+static const char *TAG_WIFI = "wifi_ap";
+static const char *TAG_CSI = "csi_collection";
+
+// Variáveis globais para armazenar SSID e senha recebidos
+char received_ssid[32] = "";
+char received_password[64] = "";
+
+// Handle para a fila que armazenará os dados CSI formatados
+static QueueHandle_t csi_data_queue;
+
+// Handle do socket UDP para envio de dados CSI
+static int udp_send_sock = -1;
+
+// Handle do socket UDP para receber comandos
+static int udp_listen_sock = -1;
+
+// Flag para controlar se a coleta de CSI está ativa
+static bool csi_collection_active = false;
+
+// Declaração antecipada das funções
+static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info);
+static void network_send_task(void *pvParameters);
+static void udp_listen_task(void *pvParameters);
+void start_csi_collection(void);
+void stop_csi_collection(void);
+
+// Estrutura para informações de pacotes PHY para diferentes chips ESP32
+typedef struct {
+    unsigned : 32; /**< reserved */
+    unsigned : 32; /**< reserved */
+    unsigned : 32; /**< reserved */
+    unsigned : 32; /**< reserved */
+    unsigned : 32; /**< reserved */
+#if CONFIG_IDF_TARGET_ESP32S2
+    unsigned : 32; /**< reserved */
+#elif CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+    unsigned : 16; /**< reserved */
+    unsigned fft_gain : 8;
+    unsigned agc_gain : 8;
+    unsigned : 32; /**< reserved */
+#endif
+    unsigned : 32; /**< reserved */
+#if CONFIG_IDF_TARGET_ESP32S2
+     signed : 8;  /**< reserved */
+    unsigned : 24; /**< reserved */
+#elif CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+    unsigned : 32; /**< reserved */
+    unsigned : 32; /**< reserved */
+    unsigned : 32; /**< reserved */
+#endif
+    unsigned : 32; /**< reserved */
+} wifi_pkt_rx_ctrl_phy_t;
+
+// Removidas as declarações externas de funções de controle de ganho
+// para evitar erros de compilação, já que não estamos usando
+// #if CONFIG_FORCE_GAIN
+//     extern void phy_fft_scale_force(bool force_en, uint8_t force_value);
+//     extern void phy_force_rx_gain(int force_en, int force_value);
+// #endif
+
+// Função para conectar-se à rede Wi-Fi recebida via HTTP
+void connect_to_wifi(const char *ssid, const char *password) {
+    // Configura a ESP32 para modo STA
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));  // Modo AP+STA para manter o servidor web ativo
+    
+    // Configura as credenciais da rede STA
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "",
+            .password = "",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            }
+        }
+    };
+    
+    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+
+    // Aplica configuração e inicia conexão
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    ESP_LOGI(TAG_WIFI, "Conectando-se a: SSID: %s", ssid);
+}
+
+// Handler para requisição HTTP POST de credenciais Wi-Fi
+esp_err_t wifi_post_handler(httpd_req_t *req) {
+    // Buffer para armazenar os dados recebidos
+    char content[256];
+    int len = httpd_req_recv(req, content, sizeof(content));
+    if (len <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    content[len] = '\0';
+
+    // Parse dos dados JSON (assumindo formato JSON { "ssid": "SSID", "password": "senha" })
+    cJSON *json = cJSON_Parse(content);
+    if (json == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Extraindo os valores de SSID e senha
+    cJSON *ssid_json = cJSON_GetObjectItem(json, "ssid");
+    cJSON *password_json = cJSON_GetObjectItem(json, "password");
+
+    if (ssid_json != NULL && password_json != NULL) {
+        strncpy(received_ssid, ssid_json->valuestring, sizeof(received_ssid));
+        strncpy(received_password, password_json->valuestring, sizeof(received_password));
+
+        // Tenta se conectar à nova rede
+        connect_to_wifi(received_ssid, received_password);
+
+        // Responde com sucesso
+        const char resp[] = "Conectando-se à nova rede Wi-Fi!";
+        httpd_resp_send(req, resp, strlen(resp));
+    } else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Dados inválidos");
+    }
+
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+// Configuração do servidor HTTP
+httpd_uri_t wifi_post_uri = {
+    .uri = "/set_wifi",
+    .method = HTTP_POST,
+    .handler = wifi_post_handler,
+    .user_ctx = NULL
+};
+
+// Página HTML simples para configuração Wi-Fi
+const char *html_page = "<!DOCTYPE html><html><head><title>ESP32 Wi-Fi Setup</title>"
+                        "<style>body{font-family:Arial;margin:20px;}</style></head>"
+                        "<body><h1>ESP32 Wi-Fi Setup</h1>"
+                        "<form id='wifiForm'>"
+                        "<p>SSID: <input type='text' id='ssid' name='ssid'></p>"
+                        "<p>Password: <input type='password' id='password' name='password'></p>"
+                        "<button type='button' onclick='submitForm()'>Connect</button>"
+                        "</form>"
+                        "<div id='status'></div>"
+                        "<script>"
+                        "function submitForm() {"
+                        "  const ssid = document.getElementById('ssid').value;"
+                        "  const password = document.getElementById('password').value;"
+                        "  const data = {ssid: ssid, password: password};"
+                        "  document.getElementById('status').innerText = 'Sending...';"
+                        "  fetch('/set_wifi', {"
+                        "    method: 'POST',"
+                        "    headers: {'Content-Type': 'application/json'},"
+                        "    body: JSON.stringify(data)"
+                        "  })"
+                        "  .then(response => response.text())"
+                        "  .then(text => {"
+                        "    document.getElementById('status').innerText = text;"
+                        "  })"
+                        "  .catch(error => {"
+                        "    document.getElementById('status').innerText = 'Error: ' + error;"
+                        "  });"
+                        "}"
+                        "</script></body></html>";
+
+// Handler para solicitação da página web principal
+esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html_page, strlen(html_page));
+    return ESP_OK;
+}
+
+// Configuração da URI para a página principal
+httpd_uri_t root_get_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = root_get_handler,
+    .user_ctx = NULL
+};
+
+// Função para iniciar o servidor HTTP
+esp_err_t start_webserver() {
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = HTTP_SERVER_PORT;
+
+    // Inicia o servidor HTTP
+    if (httpd_start(&server, &config) == ESP_OK) {
+        // Registra as URIs
+        httpd_register_uri_handler(server, &root_get_uri);
+        httpd_register_uri_handler(server, &wifi_post_uri);
+        ESP_LOGI(TAG_WIFI, "Servidor HTTP iniciado na porta %d", config.server_port);
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG_WIFI, "Falha ao iniciar o servidor HTTP");
+    return ESP_FAIL;
+}
+
+// Função para configurar o modo Access Point (AP)
+void wifi_ap_init() {
+    // Inicializa o adaptador de rede para AP
+    esp_netif_create_default_wifi_ap();
+
+    // Configura o modo Wi-Fi como AP
+    wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    
+    // Configura o ponto de acesso
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = WIFI_AP_SSID,
+            .ssid_len = strlen(WIFI_AP_SSID),
+            .password = WIFI_AP_PASSWORD,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        }
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG_WIFI, "Ponto de acesso iniciado. SSID: %s, Senha: %s", WIFI_AP_SSID, WIFI_AP_PASSWORD);
+}
+
+// Inicia a coleta de dados CSI
+void start_csi_collection() {
+    if (csi_collection_active) {
+        ESP_LOGI(TAG_CSI, "Coleta de CSI já está ativa");
+        return;
+    }
+    
+    // Configuração para coleta de CSI
+    wifi_csi_config_t csi_config = {
+        .channel_filter_en = 1,
+        .lltf_en = 1,
+        .htltf_en = 1,
+        .stbc_htltf2_en = 1,
+        .ltf_merge_en = 1,
+        .manu_scale = false,
+        .shift = false
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    
+    csi_collection_active = true;
+    ESP_LOGI(TAG_CSI, "Coleta de CSI iniciada");
+}
+
+// Para a coleta de dados CSI
+void stop_csi_collection() {
+    if (!csi_collection_active) {
+        ESP_LOGI(TAG_CSI, "Coleta de CSI já está inativa");
+        return;
+    }
+    
+    ESP_ERROR_CHECK(esp_wifi_set_csi(false));
+    csi_collection_active = false;
+    ESP_LOGI(TAG_CSI, "Coleta de CSI parada");
+}
+
+// Callback para recepção de dados CSI
+static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
+    if (!info || !info->buf) {
+        ESP_LOGW(TAG_CSI, "CSI callback recebeu dados inválidos");
+        return;
+    }
+
+    // Usa um contador estático para rastrear os pacotes
+    static int s_count = 0;
+
+    // Obtém as informações de controle e PHY
+    const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
+    wifi_pkt_rx_ctrl_phy_t *phy_info = (wifi_pkt_rx_ctrl_phy_t *)info;
+
+// Removida a lógica de controle de ganho para evitar erros de compilação
+// #if CONFIG_GAIN_CONTROL
+//    static uint16_t agc_gain_sum = 0;
+//    static uint16_t fft_gain_sum = 0;
+//    static uint8_t agc_gain_force_value = 0;
+//    static uint8_t fft_gain_force_value = 0;
+//    
+//    if (s_count < 100) {
+//        agc_gain_sum += phy_info->agc_gain;
+//        fft_gain_sum += phy_info->fft_gain;
+//    } else if (s_count == 100) {
+//        agc_gain_force_value = agc_gain_sum / 100;
+//        fft_gain_force_value = fft_gain_sum / 100;
+//        
+//        ESP_LOGI(TAG_CSI, "fft_force %d, agc_force %d", fft_gain_force_value, agc_gain_force_value);
+//    }
+// #endif
+
+    // Formata os dados CSI em uma string
+    char csi_string[MAX_CSI_DATA_LEN];
+    int offset = 0;
+
+    // Imprime o cabeçalho apenas na primeira vez
+    if (s_count == 0) {
+        ESP_LOGI(TAG_CSI, "================ CSI RECV ================");
+        ESP_LOGI(TAG_CSI, "type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,channel,local_timestamp,sig_len,rx_state,len,first_word,data");
+    }
+
+    // Formata o cabeçalho dos dados CSI
+    offset += snprintf(csi_string + offset, MAX_CSI_DATA_LEN - offset,
+                      "CSI_DATA,%d,%02x:%02x:%02x:%02x:%02x:%02x,%d,%d,%d,%d,%d,%ld,%d,%d,%d,%d",
+                      s_count, 
+                      info->mac[0], info->mac[1], info->mac[2], 
+                      info->mac[3], info->mac[4], info->mac[5],
+                      rx_ctrl->rssi, rx_ctrl->rate,
+                      rx_ctrl->noise_floor, 
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+                      phy_info->fft_gain, phy_info->agc_gain,
+#else
+                      0, 0, // Chips ESP32 originais não têm estes campos
+#endif
+                      esp_log_timestamp(),
+                      rx_ctrl->sig_len, rx_ctrl->rx_state,
+                      info->len, info->first_word_invalid);
+
+    // Adiciona os dados CSI à string
+    for (int i = 0; i < info->len; i++) {
+        offset += snprintf(csi_string + offset, MAX_CSI_DATA_LEN - offset, ",%02x", info->buf[i]);
+    }
+
+    // Envia a string de dados CSI para a fila
+    // Usa um timeout curto para não bloquear o callback por muito tempo
+    if (xQueueSend(csi_data_queue, csi_string, pdMS_TO_TICKS(10)) != pdTRUE) {
+        ESP_LOGW(TAG_CSI, "Fila de dados CSI cheia, descartando pacote");
+    }
+
+    s_count++;
+}
+
+// Task para enviar dados CSI via UDP
+static void network_send_task(void *pvParameters) {
+    char csi_string[MAX_CSI_DATA_LEN];
+    struct sockaddr_in server_addr;
+
+    // Configura o endereço do servidor
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr.s_addr);
+
+    // Cria o socket UDP para envio
+    udp_send_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_send_sock < 0) {
+        ESP_LOGE(TAG_CSI, "Erro ao criar socket UDP de envio: errno %d", errno);
+        vTaskDelete(NULL);
+    }
+    ESP_LOGI(TAG_CSI, "Socket UDP de envio criado");
+
+    // Loop principal da task
+    while (1) {
+        // Aguarda dados na fila
+        if (xQueueReceive(csi_data_queue, csi_string, portMAX_DELAY) == pdTRUE) {
+            // Envia os dados via UDP
+            int len = strlen(csi_string);
+            int err = sendto(udp_send_sock, csi_string, len, 0, 
+                           (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+            if (err < 0) {
+                ESP_LOGE(TAG_CSI, "Erro no envio UDP: errno %d", errno);
+            }
+        }
+    }
+
+    // Código nunca deve chegar aqui, mas por segurança:
+    if (udp_send_sock != -1) {
+        close(udp_send_sock);
+    }
+    vTaskDelete(NULL);
+}
+
+// Task para escutar comandos UDP
+static void udp_listen_task(void *pvParameters) {
+    struct sockaddr_in server_addr, client_addr;
+    char rx_buffer[128];
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    // Configura o socket UDP para escuta
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(UDP_LISTEN_PORT);
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // Cria o socket UDP para escuta
+    udp_listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_listen_sock < 0) {
+        ESP_LOGE(TAG_CSI, "Erro ao criar socket UDP de escuta: errno %d", errno);
+        vTaskDelete(NULL);
+    }
+
+    // Associa o socket à porta
+    int err = bind(udp_listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (err < 0) {
+        ESP_LOGE(TAG_CSI, "Erro ao fazer bind do socket UDP: errno %d", errno);
+        close(udp_listen_sock);
+        vTaskDelete(NULL);
+    }
+    
+    ESP_LOGI(TAG_CSI, "Escutando comandos UDP na porta %d", UDP_LISTEN_PORT);
+
+    // Loop principal da task
+    while (1) {
+        // Recebe dados do socket
+        int len = recvfrom(udp_listen_sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                         (struct sockaddr *)&client_addr, &client_addr_len);
+        
+        if (len < 0) {
+            ESP_LOGE(TAG_CSI, "Erro na recepção UDP: errno %d", errno);
+            continue;
+        }
+        
+        // Finaliza a string
+        rx_buffer[len] = 0;
+        
+        // Processa o comando recebido
+        if (strncmp(rx_buffer, "start", 5) == 0) {
+            ESP_LOGI(TAG_CSI, "Comando de início recebido");
+            start_csi_collection();
+        } else if (strncmp(rx_buffer, "stop", 4) == 0) {
+            ESP_LOGI(TAG_CSI, "Comando de parada recebido");
+            stop_csi_collection();
+        }
+    }
+
+    // Código nunca deve chegar aqui, mas por segurança:
+    if (udp_listen_sock != -1) {
+        close(udp_listen_sock);
+    }
+    vTaskDelete(NULL);
+}
+
+void app_main() {
+    // Inicializa o sistema NVS (necessário para o Wi-Fi)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Inicializa o sistema de rede
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Cria a fila para os dados CSI
+    csi_data_queue = xQueueCreate(50, MAX_CSI_DATA_LEN);
+    if (csi_data_queue == NULL) {
+        ESP_LOGE(TAG_CSI, "Falha ao criar fila para dados CSI");
+        return;
+    }
+
+    // Configura a ESP32 como Access Point
+    wifi_ap_init();
+
+    // Inicia o servidor HTTP
+    if (start_webserver() == ESP_OK) {
+        ESP_LOGI(TAG_WIFI, "Servidor HTTP iniciado");
+    }
+
+    // Cria tasks para envio de dados CSI e escuta de comandos
+    xTaskCreate(network_send_task, "csi_send", 4096, NULL, 5, NULL);
+    xTaskCreate(udp_listen_task, "udp_listen", 4096, NULL, 5, NULL);
+    
+    ESP_LOGI(TAG_CSI, "Sistema inicializado e pronto para uso");
+}
